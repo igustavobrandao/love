@@ -1,5 +1,4 @@
 import React, { useState, useEffect } from "react";
-// Forçando um novo deploy para limpar o cache da Vercel - 2024-07-22
 import { CoupleConfig } from "../entities/CoupleConfig";
 import { Link } from "react-router-dom";
 import { createPageUrl } from "../utils";
@@ -22,15 +21,8 @@ export default function Home() {
   const loadConfig = async () => {
     setIsLoading(true);
     try {
-      console.log("Home: Carregando configuração...");
-      const configs = await CoupleConfig.list();
-      
-      if (configs && configs.length > 0) {
-        setConfig(configs[0]);
-        console.log("Home: Configuração carregada com sucesso.");
-      } else {
-        console.log("Home: Nenhuma configuração encontrada.");
-      }
+      const loaded = await CoupleConfig.get();
+      setConfig(loaded);
     } catch (error) {
       console.error("Home: Falha ao carregar configuração:", error);
     } finally {

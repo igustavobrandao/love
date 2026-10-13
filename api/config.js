@@ -1,155 +1,98 @@
-import { createClient } from '@supabase/supabase-js';
+const { del } = require('@vercel/blob');
+const { sql } = require('./_lib/db');
+const { requireAdmin } = require('./_lib/auth');
+const { isBlobUrl } = require('./_lib/blob');
+const { send, methodNotAllowed, serverError, readJson } = require('./_lib/http');
 
-// A configuração de runtime agora é gerenciada pelo vercel.json
+async function loadConfig() {
+  const db = sql();
+  const rows = await db`SELECT * FROM couple_config ORDER BY id LIMIT 1`;
+  if (!rows.length) return null;
+  const config = rows[0];
+  const photos = await db`
+    SELECT p.id, p.public_url AS url, COALESCE(p.caption, '') AS caption, cp.display_order
+    FROM couple_photos cp JOIN photos p ON p.id = cp.photo_id
+    WHERE cp.couple_config_id = ${config.id}
+    ORDER BY cp.display_order, p.id`;
+  return { ...config, photos };
+}
 
-const supabaseUrl = process.env.SUPABASE_URL || '';
-const supabaseKey = process.env.SUPABASE_ANON_KEY || '';
-
-// Cria um cliente Supabase com timeout reduzido para evitar que a função atinja o limite da Vercel
-const supabase = createClient(supabaseUrl, supabaseKey, {
-  auth: {
-    persistSession: false,
-  },
-  global: {
-    // Define um timeout mais curto para as requisições Supabase
-    // para evitar o timeout de 60s da Vercel
-    fetch: (url, options) => {
-      const controller = new AbortController();
-      const { signal } = controller;
-      
-      // Timeout de 10 segundos para requisições ao Supabase
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-      
-      return fetch(url, { ...options, signal })
-        .then(response => {
-          clearTimeout(timeoutId);
-          return response;
-        })
-        .catch(error => {
-          clearTimeout(timeoutId);
-          throw error;
-        });
+// Valida e filtra os campos aceitos (nada além disso chega ao banco).
+function parseInput(body) {
+  const out = {};
+  if ('couple_name' in body) {
+    if (typeof body.couple_name !== 'string' || body.couple_name.length > 100) return { error: 'Nome do casal inválido' };
+    out.couple_name = body.couple_name.trim();
+  }
+  if ('custom_phrase' in body) {
+    if (typeof body.custom_phrase !== 'string' || body.custom_phrase.length > 500) return { error: 'Frase inválida' };
+    out.custom_phrase = body.custom_phrase.trim();
+  }
+  if ('relationship_start' in body) {
+    if (body.relationship_start === '' || body.relationship_start === null) {
+      out.relationship_start = null;
+    } else {
+      const d = new Date(body.relationship_start);
+      if (typeof body.relationship_start !== 'string' || isNaN(d.getTime())) return { error: 'Data inválida' };
+      out.relationship_start = d.toISOString();
     }
   }
-});
+  if ('background_music_url' in body) {
+    const url = body.background_music_url;
+    if (url && (typeof url !== 'string' || !isBlobUrl(url))) return { error: 'URL da música inválida' };
+    out.background_music_url = url || null;
+  }
+  return { data: out };
+}
 
-// Dados padrão para caso de timeout ou erro
-const DEFAULT_CONFIG = {
-  couple_name: "Seu & Amor",
-  relationship_start: new Date().toISOString(),
-  custom_phrase: "Nossa história está apenas começando...",
-  photos: []
-};
-
-export default async function handler(request) {
-  const { method, body, url } = request;
-  const { searchParams } = new URL(url);
-  const id = searchParams.get('id');
-
+module.exports = async function handler(req, res) {
   try {
-    switch (method) {
-      case 'GET':
-        let query = supabase.from('couple_config').select(`
-          *,
-          photos: couple_photos (
-            *,
-            photo: photos (*)
-          )
-        `);
-        
-        if (id) {
-          query = query.eq('id', id).single();
-        } else {
-          // Por padrão, retorna o primeiro (e único) registro
-          query = query.limit(1).single();
-        }
-
-        const { data: getData, error: getError } = await query;
-
-        if (getError && getError.code !== 'PGRST116') { // Ignora erro de "nenhum resultado"
-          console.error('Erro ao buscar configuração:', getError);
-          throw getError;
-        }
-        
-        // Formata os dados para o cliente
-        const formattedData = getData ? {
-          ...getData,
-          photos: getData.photos?.map(p => ({
-            id: p.photo.id,
-            url: p.photo.public_url,
-            caption: p.photo.caption,
-            display_order: p.display_order
-          })).sort((a,b) => a.display_order - b.display_order) || []
-        } : null;
-
-        return new Response(JSON.stringify(id ? formattedData : [formattedData].filter(Boolean)), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-
-      case 'POST':
-        const createData = typeof body === 'string' ? JSON.parse(body) : body;
-        
-        // Remove o campo 'photos' se ele existir, pois ele é gerenciado separadamente
-        if ('photos' in createData) {
-          delete createData.photos;
-        }
-
-        const { data: postData, error: postError } = await supabase
-          .from('couple_config')
-          .insert(createData)
-          .select()
-          .single();
-
-        if (postError) {
-          console.error('Erro ao criar configuração:', postError);
-          throw postError;
-        }
-        return new Response(JSON.stringify(postData), {
-          status: 201,
-          headers: { 'Content-Type': 'application/json' },
-        });
-
-      case 'PUT':
-        if (!id) {
-          return new Response(JSON.stringify({ message: 'ID é obrigatório para atualização' }), {
-            status: 400,
-            headers: { 'Content-Type': 'application/json' },
-          });
-        }
-        const updateData = typeof body === 'string' ? JSON.parse(body) : body;
-        
-        // Remove o campo 'photos' se ele existir
-        if ('photos' in updateData) {
-            delete updateData.photos;
-        }
-
-        const { data: putData, error: putError } = await supabase
-          .from('couple_config')
-          .update(updateData)
-          .eq('id', id)
-          .select()
-          .single();
-
-        if (putError) {
-          console.error('Erro ao atualizar configuração:', putError);
-          throw putError;
-        }
-        return new Response(JSON.stringify(putData), {
-          status: 200,
-          headers: { 'Content-Type': 'application/json' },
-        });
-
-      default:
-        return new Response(JSON.stringify({ message: 'Método não permitido' }), {
-          status: 405,
-          headers: { 'Allow': 'GET, POST, PUT' },
-        });
+    if (req.method === 'GET') {
+      const config = await loadConfig();
+      return send(res, 200, config, { 'Cache-Control': 'public, max-age=0, s-maxage=30, stale-while-revalidate=300' });
     }
+
+    if (req.method === 'PUT') {
+      if (!requireAdmin(req, res)) return;
+      const body = await readJson(req);
+      if (!body || typeof body !== 'object') return send(res, 400, { message: 'Corpo inválido' });
+
+      const { data, error } = parseInput(body);
+      if (error) return send(res, 400, { message: error });
+
+      const db = sql();
+      const existing = await db`SELECT * FROM couple_config ORDER BY id LIMIT 1`;
+      const cur = existing[0] || {};
+      const next = {
+        couple_name: 'couple_name' in data ? data.couple_name : cur.couple_name ?? null,
+        custom_phrase: 'custom_phrase' in data ? data.custom_phrase : cur.custom_phrase ?? null,
+        relationship_start: 'relationship_start' in data ? data.relationship_start : cur.relationship_start ?? null,
+        background_music_url: 'background_music_url' in data ? data.background_music_url : cur.background_music_url ?? null,
+      };
+
+      if (!existing.length) {
+        await db`
+          INSERT INTO couple_config (couple_name, relationship_start, background_music_url, custom_phrase)
+          VALUES (${next.couple_name}, ${next.relationship_start}, ${next.background_music_url}, ${next.custom_phrase})`;
+      } else {
+        await db`
+          UPDATE couple_config SET
+            couple_name = ${next.couple_name},
+            custom_phrase = ${next.custom_phrase},
+            relationship_start = ${next.relationship_start},
+            background_music_url = ${next.background_music_url}
+          WHERE id = ${cur.id}`;
+      }
+
+      // Música substituída ou removida: apaga o arquivo antigo do storage (best-effort)
+      if (cur.background_music_url && cur.background_music_url !== next.background_music_url) {
+        try { await del(cur.background_music_url); } catch (e) { console.error('Falha ao apagar música antiga:', e); }
+      }
+      return send(res, 200, await loadConfig());
+    }
+
+    return methodNotAllowed(res, ['GET', 'PUT']);
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      status: 500,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return serverError(res, error);
   }
-} 
+};

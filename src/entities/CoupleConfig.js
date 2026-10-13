@@ -1,214 +1,61 @@
 // src/entities/CoupleConfig.js
+// Camada de acesso às nossas APIs (/api/*). O navegador nunca fala direto com o banco.
 
-// Cache em memória para armazenar os dados entre navegações
-const configCache = {
-  data: null,
-  timestamp: 0,
-  // Cache válido por 5 minutos
-  isValid: function() {
-    return this.data && (Date.now() - this.timestamp < 5 * 60 * 1000);
-  },
-  set: function(data) {
-    this.data = data;
-    this.timestamp = Date.now();
-  },
-  clear: function() {
-    this.data = null;
-    this.timestamp = 0;
+async function apiRequest(path, options = {}) {
+  const response = await fetch(path, {
+    credentials: 'same-origin',
+    ...options,
+    headers: {
+      ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+      ...options.headers,
+    },
+  });
+  const text = await response.text();
+  const data = text ? JSON.parse(text) : null;
+  if (!response.ok) {
+    const error = new Error(data?.message || `Erro ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
-};
-
-// Helper para construir a URL completa da API
-const getApiUrl = (path) => {
-  // Em um ambiente de navegador, window.location.origin estará disponível
-  if (typeof window !== 'undefined') {
-    return `${window.location.origin}${path}`;
-  }
-  // Fallback para ambientes de servidor (não deve ser usado pelo cliente)
-  return path;
-};
-
-/**
- * Função genérica para fazer requisições à nossa API com tratamento de erro e retry.
- * @param {string} url - A URL da API.
- * @param {object} options - As opções para a função fetch.
- * @param {number} maxRetries - Número máximo de tentativas (padrão: 2)
- * @returns {Promise<any>} - O corpo da resposta em JSON.
- */
-async function apiRequest(url, options = {}, maxRetries = 2) {
-  let lastError;
-  
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      // Se não for a primeira tentativa, adiciona um pequeno delay
-      if (attempt > 0) {
-        console.log(`CoupleConfig: Tentativa ${attempt}/${maxRetries} para ${url}`);
-        // Espera um tempo progressivo entre tentativas (300ms, 600ms, etc)
-        await new Promise(r => setTimeout(r, 300 * attempt));
-      }
-      
-      // Usa um timeout maior que o padrão do navegador
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 segundos
-      
-      // Usamos o helper para garantir a URL completa
-      const fullUrl = getApiUrl(url);
-      
-      const fetchOptions = {
-        ...options,
-        signal: controller.signal
-      };
-      
-      const response = await fetch(fullUrl, fetchOptions);
-      clearTimeout(timeoutId); // Limpa o timeout se a requisição foi bem sucedida
-      
-      if (!response.ok) {
-        const errorData = await response.json().catch(() => ({ 
-          message: `HTTP error! Status: ${response.status}` 
-        }));
-        throw new Error(errorData.message || 'Erro desconhecido na API');
-      }
-
-      // Retorna null se a resposta não tiver corpo (ex: status 204)
-      const text = await response.text();
-      return text ? JSON.parse(text) : null;
-
-    } catch (error) {
-      lastError = error;
-      
-      // Loga o erro apenas se for a última tentativa ou um erro de abort
-      if (attempt === maxRetries || error.name === 'AbortError') {
-        console.error(`CoupleConfig: Erro na tentativa ${attempt+1}/${maxRetries+1}: ${error.message || error}`);
-      }
-      
-      // Se o erro for um timeout ou AbortError, tentamos novamente
-      if (error.name === 'AbortError' || error.message?.includes('timeout')) {
-        continue; // tenta novamente
-      } else {
-        // Para outros tipos de erro (como problemas de servidor), lançamos o erro
-        throw error;
-      }
-    }
-  }
-  
-  // Se chegamos aqui, significa que todas as tentativas falharam
-  throw lastError;
+  return data;
 }
 
-export const CoupleConfig = {
-  async list() {
-    console.log("CoupleConfig: Verificando cache...");
-    if (configCache.isValid()) {
-      console.log("CoupleConfig: Usando dados do cache.");
-      return [configCache.data];
-    }
-    
+export const Auth = {
+  async status() {
     try {
-      console.log("CoupleConfig: Buscando dados da API /api/config...");
-      const data = await apiRequest('/api/config', { method: 'GET' });
-      
-      if (data) {
-        configCache.set(data);
-        console.log("CoupleConfig: Cache atualizado com sucesso.");
-        return [data];
-      }
-      
-      console.log("CoupleConfig: Nenhum dado de configuração encontrado.");
-      return [];
-
-    } catch (error) {
-      console.error("CoupleConfig.list falhou:", error);
-      // Retorna array vazio em caso de erro para não quebrar a UI
-      return [];
+      const data = await apiRequest('/api/auth');
+      return !!data?.authenticated;
+    } catch {
+      return false;
     }
   },
-
-  async create(data) {
-    try {
-      console.log("CoupleConfig: Criando nova configuração...");
-      const result = await apiRequest('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      });
-      
-      // Limpa o cache antigo e atualiza com o novo resultado
-      configCache.set(result);
-      console.log("CoupleConfig: Configuração criada e cache atualizado.");
-      return result;
-    } catch (error) {
-       console.error("CoupleConfig.create falhou:", error);
-       throw error; // Propaga o erro para a UI
-    }
+  login(password) {
+    return apiRequest('/api/auth', { method: 'POST', body: JSON.stringify({ password }) });
   },
-  
-  async update(id, data) {
-    try {
-      console.log(`CoupleConfig: Atualizando configuração ID ${id}...`);
-      const result = await apiRequest('/api/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ...data, id }),
-      });
-      
-      // Limpa o cache antigo e atualiza com o novo resultado
-      configCache.set(result);
-      console.log(`CoupleConfig: Configuração ID ${id} atualizada e cache atualizado.`);
-      return result;
-    } catch (error) {
-        console.error(`CoupleConfig.update falhou para o ID ${id}:`, error);
-        throw error; // Propaga o erro para a UI
-    }
+  logout() {
+    return apiRequest('/api/auth', { method: 'DELETE' });
   },
-
-  // Método para limpar o cache manualmente se necessário
-  clearCache() {
-    console.log("CoupleConfig: Limpando cache");
-    configCache.clear();
-  }
 };
 
-// Você pode também exportar o schema se precisar dele em outro lugar
-export const schema = {
-  "name": "CoupleConfig",
-  "type": "object",
-  "properties": {
-    "name": "CoupleConfig",
-    "type": "object",
-    "properties": {
-      "couple_name": {
-        "type": "string",
-        "description": "Nome do casal (ex: João & Maria)"
-      },
-      "relationship_start": {
-        "type": "string",
-        "format": "datetime-local",
-        "description": "Data e hora do início do relacionamento"
-      },
-      "background_music_url": {
-        "type": "string",
-        "description": "URL da música de fundo"
-      },
-      "photos": {
-        "type": "array",
-        "description": "Fotos do casal para o carrossel",
-        "items": {
-          "type": "object",
-          "properties": {
-            "url": {
-              "type": "string"
-            },
-            "caption": {
-              "type": "string"
-            }
-          }
-        }
-      },
-      "custom_phrase": {
-        "type": "string",
-        "description": "Uma frase especial para aparecer abaixo do contador"
-      }
-    },
-    "required": []
-  }
+export const CoupleConfig = {
+  // Configuração pública (usada na Home). Retorna null se ainda não existir.
+  get() {
+    return apiRequest('/api/config');
+  },
+  // Somente admin
+  save(data) {
+    return apiRequest('/api/config', { method: 'PUT', body: JSON.stringify(data) });
+  },
+};
+
+export const Photos = {
+  register(photo) {
+    return apiRequest('/api/photos', { method: 'POST', body: JSON.stringify(photo) });
+  },
+  updateCaption(id, caption) {
+    return apiRequest(`/api/photos?id=${id}`, { method: 'PATCH', body: JSON.stringify({ caption }) });
+  },
+  remove(id) {
+    return apiRequest(`/api/photos?id=${id}`, { method: 'DELETE' });
+  },
 };
