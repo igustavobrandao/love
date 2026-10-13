@@ -49,7 +49,7 @@ module.exports = async function handler(req, res) {
   try {
     if (req.method === 'GET') {
       const config = await loadConfig();
-      return send(res, 200, config, { 'Cache-Control': 'public, max-age=0, s-maxage=30, stale-while-revalidate=300' });
+      return send(res, 200, config, { 'Cache-Control': 'no-store' });
     }
 
     if (req.method === 'PUT') {

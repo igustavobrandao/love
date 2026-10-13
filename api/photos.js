@@ -18,7 +18,7 @@ module.exports = async function handler(req, res) {
         SELECT p.id, p.public_url AS url, COALESCE(p.caption, '') AS caption, cp.display_order
         FROM couple_photos cp JOIN photos p ON p.id = cp.photo_id
         ORDER BY cp.display_order, p.id`;
-      return send(res, 200, rows, { 'Cache-Control': 'public, max-age=0, s-maxage=30, stale-while-revalidate=300' });
+      return send(res, 200, rows, { 'Cache-Control': 'no-store' });
     }
 
     if (!['POST', 'PATCH', 'DELETE'].includes(req.method)) {
