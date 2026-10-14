@@ -19,8 +19,7 @@ module.exports = async function handler(req, res) {
     const body = await readJson(req);
     if (!body) return send(res, 400, { message: 'Corpo inválido' });
 
-    // Só o pedido de token exige admin. O callback "upload-completed" vem do
-    // próprio Vercel Blob (sem cookie) e é validado por assinatura dentro do handleUpload.
+    // Só emitimos token de upload para o admin logado.
     if (body.type === 'blob.generate-client-token' && !requireAdmin(req, res)) return;
 
     const json = await handleUpload({
@@ -35,7 +34,6 @@ module.exports = async function handler(req, res) {
           addRandomSuffix: true,
         };
       },
-      onUploadCompleted: async () => {},
     });
     return send(res, 200, json);
   } catch (error) {
