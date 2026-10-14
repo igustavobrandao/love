@@ -29,7 +29,7 @@ export default function FallingHearts() {
   }, []);
 
   return (
-    <div className="fixed inset-0 pointer-events-none z-10 overflow-hidden">
+    <div className="fixed inset-0 pointer-events-none z-30 overflow-hidden">
       {hearts.map(heart => (
         <div
           key={heart.id}
