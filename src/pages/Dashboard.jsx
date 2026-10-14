@@ -1,421 +1,422 @@
-import React, { useState, useEffect } from "react";
-import { CoupleConfig, Auth, Photos } from "../entities/CoupleConfig";
-import { UploadFile } from "../integrations/Core";
-import { Button } from "../components/ui/button";
-import { Input } from "../components/ui/input";
-import { Label } from "../components/ui/label";
-import { Card, CardContent, CardHeader, CardTitle } from "../components/ui/card";
-import { Textarea } from "../components/ui/textarea";
-import { Heart, Upload, Music, Image, Trash2, Save, FileAudio, LogOut, Lock } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { Heart } from "lucide-react";
+import { Auth, CoupleConfig, Photos } from "../entities/CoupleConfig";
+import { UploadFile, validateFile } from "../integrations/Core";
 import { createPageUrl } from "../utils";
+import { Button } from "../components/ui/button";
+import { ToastProvider, useToast } from "../components/dashboard/Toast";
+import ConfirmDialog from "../components/dashboard/ConfirmDialog";
+import MessageDialog from "../components/dashboard/MessageDialog";
+import LoginForm from "../components/dashboard/LoginForm";
+import DashboardHeader from "../components/dashboard/DashboardHeader";
+import DashboardSkeleton from "../components/dashboard/DashboardSkeleton";
+import BasicInfoCard from "../components/dashboard/BasicInfoCard";
+import PhotosCard from "../components/dashboard/PhotosCard";
+import MusicCard from "../components/dashboard/MusicCard";
+import SaveBar from "../components/dashboard/SaveBar";
+import useUnsavedGuard from "../components/dashboard/useUnsavedGuard";
+import { friendlyError } from "../components/dashboard/errors";
+
+// Campos que dependem do botão "Salvar" (fotos e legendas salvam na hora)
+const FIELDS = ["couple_name", "relationship_start", "custom_phrase", "background_music_url"];
+// Quantas fotos sobem ao mesmo tempo
+const UPLOAD_CONCURRENCY = 3;
+const EMPTY = { couple_name: "", relationship_start: "", custom_phrase: "", background_music_url: "" };
 
 // ISO (UTC) -> valor para <input type="datetime-local"> no fuso do navegador
 const toLocalInput = (iso) => {
-  if (!iso) return '';
+  if (!iso) return "";
   const d = new Date(iso);
-  if (isNaN(d.getTime())) return '';
-  const pad = (n) => String(n).padStart(2, '0');
+  if (isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 };
 
-const EMPTY_CONFIG = {
-  couple_name: '',
-  relationship_start: '',
-  background_music_url: '',
-  photos: [],
-  custom_phrase: '',
-};
-
-function LoginForm({ onSuccess }) {
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  const handleSubmit = async (e) => {
-    e.preventDefault();
-    setIsSubmitting(true);
-    setError('');
-    try {
-      await Auth.login(password);
-      onSuccess();
-    } catch (err) {
-      setError(err.message);
-      setPassword('');
-    } finally {
-      setIsSubmitting(false);
-    }
-  };
-
-  return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <form onSubmit={handleSubmit} className="w-full max-w-sm space-y-4 text-center">
-        <Lock className="w-10 h-10 text-[#FF6B6B] mx-auto" />
-        <h1 className="text-2xl font-bold text-white">Área restrita</h1>
-        <Input
-          type="password"
-          autoFocus
-          autoComplete="current-password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Senha"
-          className="bg-white/10 border-white/20 text-white placeholder:text-white/50"
-        />
-        {error && <p className="text-red-400 text-sm">{error}</p>}
-        <Button
-          type="submit"
-          disabled={isSubmitting || !password}
-          className="w-full bg-[#FF6B6B] hover:bg-[#FF6B6B]/90 text-white"
-        >
-          {isSubmitting ? 'Entrando...' : 'Entrar'}
-        </Button>
-      </form>
-    </div>
-  );
-}
-
-export default function Dashboard() {
+function DashboardContent() {
   const navigate = useNavigate();
-  const [authState, setAuthState] = useState('checking'); // checking | out | in
-  const [config, setConfig] = useState(EMPTY_CONFIG);
+  const toast = useToast();
+
+  const [authState, setAuthState] = useState("checking"); // checking | out | in
+  const [loginNotice, setLoginNotice] = useState("");
   const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState(false);
+  const [draft, setDraft] = useState(EMPTY);
+  const [saved, setSaved] = useState(EMPTY);
+  const [photos, setPhotos] = useState([]);
+  const [captionStatus, setCaptionStatus] = useState({});
   const [isSaving, setIsSaving] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
+  const [uploads, setUploads] = useState([]);
+  const [musicUpload, setMusicUpload] = useState(null);
+  const [confirm, setConfirm] = useState(null); // { type: 'photo' | 'music' | 'discard', photo? }
+  const [isRemoving, setIsRemoving] = useState(false);
+  const [problems, setProblems] = useState(null); // { title, description, items }
+
+  const hasLoaded = useRef(false);
+  const savedCaptions = useRef(new Map());
+  const uploadSeq = useRef(0);
+  const registerChain = useRef(Promise.resolve());
+
+  const dirty = useMemo(() => FIELDS.some((k) => draft[k] !== saved[k]), [draft, saved]);
+  const guard = useUnsavedGuard(dirty);
 
   useEffect(() => {
-    Auth.status().then((ok) => setAuthState(ok ? 'in' : 'out'));
+    Auth.status().then((ok) => setAuthState(ok ? "in" : "out"));
   }, []);
 
   useEffect(() => {
-    if (authState === 'in') loadConfig();
-  }, [authState]);
-
-  // Sessão expirada no meio da edição: volta para o login
-  const handleApiError = (error, fallbackMessage) => {
-    if (error.status === 401) {
-      setAuthState('out');
-      return;
-    }
-    alert(`${fallbackMessage}: ${error.message}`);
-  };
+    if (authState === "in" && !hasLoaded.current) loadConfig();
+  }, [authState]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const loadConfig = async () => {
     setIsLoading(true);
+    setLoadError(false);
     try {
       const loaded = await CoupleConfig.get();
-      if (loaded) {
-        setConfig({
-          couple_name: loaded.couple_name || '',
-          relationship_start: toLocalInput(loaded.relationship_start),
-          background_music_url: loaded.background_music_url || '',
-          photos: loaded.photos || [],
-          custom_phrase: loaded.custom_phrase || '',
-        });
-      }
+      const values = loaded
+        ? {
+            couple_name: loaded.couple_name || "",
+            relationship_start: toLocalInput(loaded.relationship_start),
+            custom_phrase: loaded.custom_phrase || "",
+            background_music_url: loaded.background_music_url || "",
+          }
+        : EMPTY;
+      const loadedPhotos = loaded?.photos || [];
+      savedCaptions.current = new Map(loadedPhotos.map((p) => [p.id, p.caption]));
+      setDraft(values);
+      setSaved(values);
+      setPhotos(loadedPhotos);
+      hasLoaded.current = true;
     } catch (error) {
-      console.error("Dashboard: Falha ao carregar configuração:", error);
+      console.error("Dashboard: falha ao carregar configuração:", error);
+      setLoadError(true);
     } finally {
       setIsLoading(false);
     }
   };
 
+  // Sessão caiu no meio da edição: volta ao login sem perder o que já foi digitado
+  const sessionExpired = () => {
+    setLoginNotice("Sua sessão expirou. Entre de novo; o que você digitou continua aqui.");
+    setAuthState("out");
+  };
+
+  // Trata erro de API: 401 volta ao login, o resto vira aviso
+  const handleError = (error, prefix) => {
+    if (error?.status === 401) return sessionExpired();
+    toast.error(`${prefix} ${friendlyError(error)}`);
+  };
+
+  const setField = (field, value) => setDraft((d) => ({ ...d, [field]: value }));
+
   const handleLogout = async () => {
     await Auth.logout().catch(() => {});
-    setAuthState('out');
+    setLoginNotice("");
+    setAuthState("out");
   };
 
   const handleSave = async () => {
     setIsSaving(true);
     try {
       await CoupleConfig.save({
-        couple_name: config.couple_name,
-        custom_phrase: config.custom_phrase,
-        background_music_url: config.background_music_url,
+        couple_name: draft.couple_name,
+        custom_phrase: draft.custom_phrase,
+        background_music_url: draft.background_music_url,
         // datetime-local não tem fuso; new Date() interpreta no fuso do navegador
-        relationship_start: config.relationship_start
-          ? new Date(config.relationship_start).toISOString()
-          : '',
+        relationship_start: draft.relationship_start ? new Date(draft.relationship_start).toISOString() : "",
       });
-      alert('Configurações salvas com sucesso!');
-      navigate(createPageUrl("Home"));
+      setSaved(draft);
+      toast.success("Alterações salvas!", {
+        action: { label: "Ver história", onClick: () => navigate(createPageUrl("Home")) },
+      });
     } catch (error) {
-      handleApiError(error, 'Falha ao salvar as configurações');
+      handleError(error, "Não foi possível salvar.");
     } finally {
       setIsSaving(false);
     }
   };
 
-  const handlePhotoUpload = async (e) => {
-    const files = Array.from(e.target.files || []);
-    e.target.value = '';
-    if (!files.length) return;
+  // ----- Fotos -----
 
-    setIsUploading(true);
-    const added = [];
-    const failed = [];
-    for (const file of files) {
-      try {
-        const uploaded = await UploadFile({ file, folder: 'photos' });
-        const photo = await Photos.register({
-          url: uploaded.file_url,
-          pathname: uploaded.pathname,
-          mime_type: uploaded.mime_type,
-          size_bytes: uploaded.size_bytes,
-        });
-        added.push(photo);
-      } catch (error) {
-        if (error.status === 401) { setAuthState('out'); break; }
-        failed.push(`${file.name} (${error.message})`);
-      }
-    }
-    if (added.length) {
-      setConfig(prev => ({ ...prev, photos: [...prev.photos, ...added] }));
-    }
-    if (failed.length) alert(`Não foi possível enviar:\n${failed.join('\n')}`);
-    setIsUploading(false);
+  const patchUpload = (id, patch) => setUploads((all) => all.map((u) => (u.id === id ? { ...u, ...patch } : u)));
+
+  // O registro no banco é serializado: os envios correm em paralelo, mas assim a
+  // ordem das fotos e a criação da configuração inicial não disputam entre si.
+  const registerSerial = (payload) => {
+    const run = registerChain.current.then(() => Photos.register(payload));
+    registerChain.current = run.catch(() => {});
+    return run;
   };
 
-  const handleMusicUpload = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = '';
-    if (!file) return;
+  const handlePhotoFiles = async (files) => {
+    const failures = [];
+    const valid = [];
+    files.forEach((file) => {
+      const reason = validateFile(file, "photos");
+      if (reason) failures.push({ name: file.name, reason });
+      else valid.push(file);
+    });
 
-    setIsUploading(true);
-    try {
-      const { file_url } = await UploadFile({ file, folder: 'music' });
-      setConfig(prev => ({ ...prev, background_music_url: file_url }));
-    } catch (error) {
-      handleApiError(error, 'Falha ao fazer upload da música');
-    } finally {
-      setIsUploading(false);
-    }
-  };
-
-  const removePhoto = async (photoId) => {
-    if (!window.confirm('Remover esta foto definitivamente?')) return;
-    try {
-      await Photos.remove(photoId);
-      setConfig(prev => ({ ...prev, photos: prev.photos.filter((p) => p.id !== photoId) }));
-    } catch (error) {
-      handleApiError(error, 'Falha ao remover a foto');
-    }
-  };
-
-  const updatePhotoCaption = (photoId, caption) => {
-    setConfig(prev => ({
-      ...prev,
-      photos: prev.photos.map((photo) =>
-        photo.id === photoId ? { ...photo, caption } : photo
-      )
+    const items = valid.map((file) => ({
+      id: ++uploadSeq.current,
+      file,
+      name: file.name,
+      preview: URL.createObjectURL(file), // prévia imediata, antes do envio terminar
+      progress: 0,
+      stage: "Enviando",
     }));
-  };
+    setUploads((all) => [...all, ...items]);
 
-  const saveCaption = async (photoId, caption) => {
-    try {
-      await Photos.updateCaption(photoId, caption);
-    } catch (error) {
-      handleApiError(error, 'Falha ao salvar a legenda');
+    let added = 0;
+    let expired = false;
+    const usedPreviews = new Set();
+
+    const processPhoto = async (item) => {
+      try {
+        const up = await UploadFile({ file: item.file, folder: "photos", onProgress: (p) => patchUpload(item.id, { progress: p }) });
+        patchUpload(item.id, { progress: 100, stage: "Salvando" });
+        const photo = await registerSerial({
+          url: up.file_url,
+          pathname: up.pathname,
+          mime_type: up.mime_type,
+          size_bytes: up.size_bytes,
+        });
+        savedCaptions.current.set(photo.id, photo.caption);
+        usedPreviews.add(item.preview);
+        // Anexa na grade assim que esta foto termina, sem esperar as outras
+        setPhotos((all) => [...all, { ...photo, preview: item.preview }]);
+        added += 1;
+      } catch (error) {
+        if (error?.status === 401) expired = true;
+        else failures.push({ name: item.name, reason: friendlyError(error) });
+      } finally {
+        setUploads((all) => all.filter((u) => u.id !== item.id));
+      }
+    };
+
+    const queue = [...items];
+    const workers = Array.from({ length: Math.min(UPLOAD_CONCURRENCY, queue.length) }, async () => {
+      while (queue.length && !expired) await processPhoto(queue.shift());
+    });
+    await Promise.all(workers);
+
+    // Limpeza: itens que não chegaram a ser processados e prévias não aproveitadas
+    setUploads((all) => all.filter((u) => !items.some((i) => i.id === u.id)));
+    items.forEach((i) => !usedPreviews.has(i.preview) && URL.revokeObjectURL(i.preview));
+
+    if (expired) sessionExpired();
+    if (added > 0) toast.success(added === 1 ? "Foto adicionada!" : `${added} fotos adicionadas!`);
+    if (failures.length > 0) {
+      setProblems({
+        title: failures.length === 1 ? "Uma foto não foi enviada" : `${failures.length} fotos não foram enviadas`,
+        description: added > 0 ? "As demais foram enviadas normalmente." : undefined,
+        items: failures,
+      });
     }
   };
 
-  if (authState === 'checking') {
+  const handleCaptionChange = (id, caption) => {
+    setPhotos((all) => all.map((p) => (p.id === id ? { ...p, caption } : p)));
+    setCaptionStatus((s) => ({ ...s, [id]: undefined }));
+  };
+
+  const handleCaptionCommit = async (id, caption) => {
+    if (savedCaptions.current.get(id) === caption) return;
+    setCaptionStatus((s) => ({ ...s, [id]: "saving" }));
+    try {
+      await Photos.updateCaption(id, caption);
+      savedCaptions.current.set(id, caption);
+      setCaptionStatus((s) => ({ ...s, [id]: "saved" }));
+      setTimeout(() => setCaptionStatus((s) => (s[id] === "saved" ? { ...s, [id]: undefined } : s)), 2000);
+    } catch (error) {
+      if (error?.status === 401) sessionExpired();
+      setCaptionStatus((s) => ({ ...s, [id]: "error" }));
+    }
+  };
+
+  // ----- Música -----
+
+  const handleMusicFiles = async ([file]) => {
+    const reason = validateFile(file, "music");
+    if (reason) {
+      setProblems({ title: "Não foi possível enviar a música", items: [{ name: file.name, reason }] });
+      return;
+    }
+    setMusicUpload({ name: file.name, progress: 0 });
+    try {
+      const up = await UploadFile({
+        file,
+        folder: "music",
+        onProgress: (p) => setMusicUpload((u) => (u ? { ...u, progress: p } : u)),
+      });
+      setField("background_music_url", up.file_url);
+      toast.info("Música enviada. Clique em Salvar para aplicá-la.");
+    } catch (error) {
+      if (error?.status === 401) sessionExpired();
+      else setProblems({ title: "Não foi possível enviar a música", items: [{ name: file.name, reason: friendlyError(error) }] });
+    } finally {
+      setMusicUpload(null);
+    }
+  };
+
+  // ----- Confirmações -----
+
+  const closeConfirm = () => !isRemoving && setConfirm(null);
+
+  const confirmRemovePhoto = async () => {
+    const { photo } = confirm;
+    setIsRemoving(true);
+    try {
+      await Photos.remove(photo.id);
+      savedCaptions.current.delete(photo.id);
+      if (photo.preview) URL.revokeObjectURL(photo.preview);
+      setPhotos((all) => all.filter((p) => p.id !== photo.id));
+      toast.success("Foto removida.");
+    } catch (error) {
+      handleError(error, "Não foi possível remover a foto.");
+    } finally {
+      setIsRemoving(false);
+      setConfirm(null);
+    }
+  };
+
+  const confirmRemoveMusic = () => {
+    setField("background_music_url", "");
+    setConfirm(null);
+    toast.info("Música removida. Clique em Salvar para aplicar.");
+  };
+
+  const confirmDiscard = () => {
+    setDraft(saved);
+    setConfirm(null);
+    toast.info("Alterações descartadas.");
+  };
+
+  // ----- Telas -----
+
+  if (authState === "checking") {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-900">
-        <Heart className="w-16 h-16 text-[#FF6B6B] animate-pulse" />
+      <div className="flex min-h-screen items-center justify-center bg-gray-900">
+        <Heart className="h-16 w-16 animate-pulse text-[#FF6B6B]" />
       </div>
     );
   }
 
-  if (authState === 'out') {
-    return <LoginForm onSuccess={() => setAuthState('in')} />;
+  if (authState === "out") {
+    return <LoginForm notice={loginNotice} onSuccess={() => { setLoginNotice(""); setAuthState("in"); }} />;
   }
 
-  if (isLoading) {
+  if (isLoading) return <DashboardSkeleton />;
+
+  if (loadError) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gray-900">
-        <div className="flex flex-col items-center">
-           <Heart className="w-16 h-16 text-[#FF6B6B] animate-pulse" />
-           <p className="text-white mt-4">Carregando sua história...</p>
+      <div className="flex min-h-screen items-center justify-center px-4">
+        <div className="max-w-sm space-y-4 text-center">
+          <Heart className="mx-auto h-10 w-10 text-[#FF6B6B]" />
+          <h1 className="text-xl font-semibold text-white">Não foi possível carregar</h1>
+          <p className="text-sm text-white/60">
+            Por segurança, a edição fica bloqueada para não sobrescrever seus dados com campos vazios.
+          </p>
+          <Button onClick={loadConfig}>Tentar de novo</Button>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen pt-20 pb-8 px-4">
-      <div className={`max-w-4xl mx-auto space-y-8 transition-opacity ${isLoading ? 'opacity-70' : 'opacity-100'}`}>
-        
-        {/* Header */}
-        <div className="text-center space-y-4">
-          <div className="flex items-center justify-center gap-3">
-            <Heart className="w-8 h-8 text-[#FF6B6B]" fill="currentColor" />
-            <h1 className="text-4xl font-bold text-white">Dashboard do Casal</h1>
-            <Heart className="w-8 h-8 text-[#FF6B6B]" fill="currentColor" />
-          </div>
-          <p className="text-white/70 text-lg">Configure sua história de amor</p>
-          <Button variant="ghost" onClick={handleLogout} className="text-white/60 hover:text-white">
-            <LogOut className="w-4 h-4 mr-2" /> Sair
-          </Button>
-        </div>
-
-        {/* Basic Info */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Heart className="w-5 h-5 text-[#FF6B6B]" />
-              Informações Básicas
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div>
-              <Label className="text-white">Nome do Casal</Label>
-              <Input
-                value={config.couple_name}
-                onChange={(e) => setConfig(prev => ({ ...prev, couple_name: e.target.value }))}
-                placeholder="Ex: João & Maria"
-                className="bg-white/10 border-white/20 text-white placeholder:text-white/50"
-              />
-            </div>
-            <div>
-              <Label className="text-white">Data e Hora do Início do Relacionamento</Label>
-              <Input
-                type="datetime-local"
-                value={config.relationship_start}
-                onChange={(e) => setConfig(prev => ({ ...prev, relationship_start: e.target.value }))}
-                className="bg-white/10 border-white/20 text-white"
-              />
-            </div>
-            <div>
-              <Label className="text-white">Frase Especial</Label>
-              <Textarea
-                value={config.custom_phrase}
-                onChange={(e) => setConfig(prev => ({ ...prev, custom_phrase: e.target.value }))}
-                placeholder="Ex: Onde tudo começou..."
-                className="bg-white/10 border-white/20 text-white placeholder:text-white/50"
-              />
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Photos */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Image className="w-5 h-5 text-[#FF6B6B]" />
-              Fotos do Casal
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div>
-              <Label htmlFor="photo-upload" className="cursor-pointer">
-                <div className="border-2 border-dashed border-[#FF6B6B]/50 rounded-lg p-6 text-center hover:border-[#FF6B6B] transition-colors">
-                  <Upload className="w-8 h-8 text-[#FF6B6B] mx-auto mb-2" />
-                  <p className="text-white">Clique para adicionar fotos</p>
-                  <p className="text-white/50 text-sm">PNG, JPG, GIF, WEBP até 10MB</p>
-                </div>
-              </Label>
-              <input
-                id="photo-upload"
-                type="file"
-                accept="image/*"
-                onChange={handlePhotoUpload}
-                className="hidden"
-                disabled={isUploading}
-                multiple
-              />
-            </div>
-
-            {config.photos.length > 0 && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                {config.photos.map((photo, index) => (
-                  <div key={photo.id} className="space-y-2">
-                    <div className="relative">
-                      <img 
-                        src={photo.url} 
-                        alt={`Foto ${index + 1}`}
-                        className="w-full h-40 object-cover rounded-lg"
-                      />
-                      <Button
-                        size="icon"
-                        variant="destructive"
-                        className="absolute top-2 right-2"
-                        onClick={() => removePhoto(photo.id)}
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </Button>
-                    </div>
-                    <Textarea
-                      placeholder="Legenda da foto (opcional)"
-                      value={photo.caption}
-                      onChange={(e) => updatePhotoCaption(photo.id, e.target.value)}
-                      onBlur={(e) => saveCaption(photo.id, e.target.value)}
-                      maxLength={300}
-                      className="bg-white/10 border-white/20 text-white placeholder:text-white/50"
-                    />
-                  </div>
-                ))}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Music */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Music className="w-5 h-5 text-[#FF6B6B]" />
-              Música de Fundo
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div>
-              <Label htmlFor="music-upload" className="cursor-pointer">
-                <div className="border-2 border-dashed border-[#FF6B6B]/50 rounded-lg p-6 text-center hover:border-[#FF6B6B] transition-colors">
-                  <Music className="w-8 h-8 text-[#FF6B6B] mx-auto mb-2" />
-                  <p className="text-white">
-                    {isUploading ? 'Enviando...' : (config.background_music_url ? 'Alterar música' : 'Clique para adicionar música')}
-                  </p>
-                  <p className="text-white/50 text-sm">MP3, WAV, OGG, M4A até 50MB</p>
-                </div>
-              </Label>
-              <input
-                id="music-upload"
-                type="file"
-                accept="audio/*"
-                onChange={handleMusicUpload}
-                className="hidden"
-                disabled={isUploading}
-              />
-            </div>
-            {config.background_music_url && (
-              <div className="flex items-center gap-2 p-3 bg-white/10 rounded-lg">
-                <FileAudio className="w-5 h-5 text-[#FF6B6B]" />
-                <p className="text-white/80 text-sm truncate flex-1">Música carregada</p>
-                <Button 
-                  size="icon" 
-                  variant="ghost" 
-                  className="w-8 h-8"
-                  onClick={() => setConfig(prev => ({...prev, background_music_url: ''}))}
-                >
-                  <Trash2 className="w-4 h-4 text-red-500"/>
-                </Button>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Save Button */}
-        <div className="flex justify-center">
-          <Button 
-            onClick={handleSave}
-            disabled={isSaving}
-            className="bg-[#FF6B6B] hover:bg-[#FF6B6B]/90 text-white px-8 py-3 text-lg"
-          >
-            <Save className="w-5 h-5 mr-2" />
-            {isSaving ? 'Salvando...' : 'Salvar Configurações'}
-          </Button>
+    <>
+      <div className="min-h-screen px-4 pb-32 pt-20">
+        <div className="mx-auto max-w-4xl space-y-8">
+          <DashboardHeader dirty={dirty} onLogout={handleLogout} />
+          <BasicInfoCard values={draft} onChange={setField} />
+          <PhotosCard
+            photos={photos}
+            uploads={uploads}
+            captionStatus={captionStatus}
+            onFiles={handlePhotoFiles}
+            onCaptionChange={handleCaptionChange}
+            onCaptionCommit={handleCaptionCommit}
+            onRemove={(photo) => setConfirm({ type: "photo", photo })}
+          />
+          <MusicCard
+            url={draft.background_music_url}
+            pending={draft.background_music_url !== saved.background_music_url}
+            upload={musicUpload}
+            onFiles={handleMusicFiles}
+            onRemove={() => setConfirm({ type: "music" })}
+          />
         </div>
       </div>
-    </div>
+
+      <SaveBar
+        dirty={dirty}
+        saving={isSaving}
+        disabled={!!musicUpload}
+        onSave={handleSave}
+        onDiscard={() => setConfirm({ type: "discard" })}
+      />
+
+      <ConfirmDialog
+        open={confirm?.type === "photo"}
+        title="Remover esta foto?"
+        description="Ela sai da página principal e o arquivo é apagado. Não dá para desfazer."
+        confirmLabel="Remover"
+        destructive
+        loading={isRemoving}
+        onConfirm={confirmRemovePhoto}
+        onCancel={closeConfirm}
+      >
+        {confirm?.photo && (
+          <img src={confirm.photo.url} alt="" className="max-h-48 w-full rounded-lg object-cover" />
+        )}
+      </ConfirmDialog>
+
+      <ConfirmDialog
+        open={confirm?.type === "music"}
+        title="Remover a música?"
+        description="A página principal fica sem música depois que você salvar."
+        confirmLabel="Remover"
+        destructive
+        onConfirm={confirmRemoveMusic}
+        onCancel={closeConfirm}
+      />
+
+      <ConfirmDialog
+        open={confirm?.type === "discard"}
+        title="Descartar alterações?"
+        description="Nome, data, frase e música voltam ao último estado salvo."
+        confirmLabel="Descartar"
+        destructive
+        onConfirm={confirmDiscard}
+        onCancel={closeConfirm}
+      />
+
+      <ConfirmDialog
+        open={!!guard.pendingHref}
+        title="Sair sem salvar?"
+        description="Você tem alterações que ainda não foram salvas. Se sair agora, elas serão perdidas."
+        confirmLabel="Sair sem salvar"
+        cancelLabel="Continuar editando"
+        destructive
+        onConfirm={guard.confirmLeave}
+        onCancel={guard.cancelLeave}
+      />
+
+      <MessageDialog
+        open={!!problems}
+        title={problems?.title}
+        description={problems?.description}
+        items={problems?.items}
+        onClose={() => setProblems(null)}
+      />
+    </>
+  );
+}
+
+export default function Dashboard() {
+  return (
+    <ToastProvider>
+      <DashboardContent />
+    </ToastProvider>
   );
 }
